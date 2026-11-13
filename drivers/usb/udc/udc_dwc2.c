@@ -347,6 +347,26 @@ static bool dwc2_dma_buffer_ok_to_use(const struct device *dev, void *buf,
 }
 
 /* Can be called from ISR context */
+/* TEMP slx click-latency instrumentation: weak hooks overridden by the dongle
+ * app (dongle_hid.c). armed = IN EP enabled + FIFO written (DWC2 thread or
+ * ISR on multi-part); done = XFERCOMPL in hard ISR. Local patch, not for
+ * upstream.
+ */
+void __weak udc_dwc2_lat_ep_armed(uint8_t ep_idx)
+{
+	ARG_UNUSED(ep_idx);
+}
+
+void __weak udc_dwc2_lat_ep_done(uint8_t ep_idx)
+{
+	ARG_UNUSED(ep_idx);
+}
+
+void __weak udc_dwc2_lat_ep_posted(uint8_t ep_idx)
+{
+	ARG_UNUSED(ep_idx);
+}
+
 static int dwc2_tx_fifo_write(const struct device *dev,
 			      struct udc_ep_config *const cfg, struct net_buf *const buf)
 {
@@ -516,6 +536,8 @@ static int dwc2_tx_fifo_write(const struct device *dev,
 
 	k_event_clear(&priv->ep_disabled, BIT(ep_idx));
 	k_spin_unlock(&priv->lock, key);
+
+	udc_dwc2_lat_ep_armed(ep_idx);
 
 	return 0;
 }
@@ -1550,6 +1572,10 @@ static int udc_dwc2_ep_enqueue(const struct device *dev,
 {
 	struct udc_dwc2_data *const priv = udc_get_private(dev);
 
+	if (USB_EP_DIR_IS_IN(cfg->addr)) {
+		udc_dwc2_lat_ep_posted(USB_EP_GET_IDX(cfg->addr));
+	}
+
 	LOG_DBG("%p enqueue %x %p", dev, cfg->addr, buf);
 
 	if (dwc2_in_buffer_dma_mode(dev)) {
@@ -1566,6 +1592,19 @@ static int udc_dwc2_ep_enqueue(const struct device *dev,
 
 	if (!cfg->stat.halted) {
 		int ep_bit;
+
+		if (USB_EP_DIR_IS_IN(cfg->addr) && cfg->addr != USB_CONTROL_EP_IN &&
+		    !priv->hibernated && !udc_ep_is_busy(cfg)) {
+			/* TEMP slx direct-arm experiment: the caller
+			 * (udc_ep_enqueue) holds the UDC lock — the same lock
+			 * dwc2_thread_handler takes around this call — and the
+			 * EP is idle, so arm the transfer inline instead of
+			 * hopping through the driver thread (~19 us saved per
+			 * report on nRF54 USBHS @ -O2).
+			 */
+			dwc2_handle_xfer_next(dev, cfg);
+			return 0;
+		}
 
 		if (USB_EP_DIR_IS_IN(cfg->addr)) {
 			ep_bit = USB_EP_GET_IDX(cfg->addr);
@@ -2442,6 +2481,8 @@ static inline void dwc2_handle_in_xfercompl(const struct device *dev,
 	atomic_set_bit(&priv->xfer_finished, ep_idx);
 	k_event_post(&priv->ep_disabled, BIT(ep_idx));
 	k_event_post(&priv->drv_evt, BIT(DWC2_DRV_EVT_EP_FINISHED));
+
+	udc_dwc2_lat_ep_done(ep_idx);
 }
 
 static inline void dwc2_handle_iepint(const struct device *dev)
